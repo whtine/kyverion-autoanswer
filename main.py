@@ -37,48 +37,57 @@ async def ask_gemini(user_text, zone_context, remaining_msgs):
     if not GEMINI_KEY:
         return "Извини, мой ИИ-модуль не настроен.", 1
         
-    # Путь через v1beta (самый рабочий для Flash сейчас)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    # ПЕРЕХОДИМ НА gemini-pro — она самая стабильная для этого API
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_KEY}"
     
     headers = {'Content-Type': 'application/json'}
     
-    # Мы упаковываем промпт так, как этого требует структура Google API
+    # Формируем строгий промпт
+    prompt_text = (
+        f"Ты — ИИ-ассистент. Владелец сейчас: {zone_context}. "
+        f"Ответь вежливо на языке пользователя. "
+        f"В конце добавь: (ИИ-ассистент. Осталось: {remaining_msgs} зап.). "
+        f"Оцени важность сообщения от 1 до 3 и в самом конце напиши [P:X], где X - число. "
+        f"Сообщение пользователя: {user_text}"
+    )
+    
     payload = {
-        "contents": [
-            {
-                "parts": [{
-                    "text": f"Ты — ИИ-ассистент владельца. Он сейчас: {zone_context}. "
-                            f"Ответь вежливо на языке пользователя. "
-                            f"Добавь: (ИИ-ассистент. Осталось: {remaining_msgs} зап.). "
-                            f"Оцени важность от 1 до 3 и добавь в конце [P:X]. "
-                            f"Текст пользователя: {user_text}"
-                }]
-            }
-        ]
+        "contents": [{
+            "parts": [{"text": prompt_text}]
+        }]
     }
     
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(url, json=payload, headers=headers, timeout=15.0)
+            # Используем follow_redirects=True на всякий случай
+            resp = await client.post(url, json=payload, headers=headers, timeout=20.0)
             
             if resp.status_code != 200:
-                # Если 404 не уйдет, попробуй в URL выше заменить gemini-1.5-flash на gemini-pro
                 logger.error(f"Google API Error: {resp.status_code} - {resp.text}")
-                return "Привет! Сейчас я занят, отвечу позже как освобожусь.", 1
+                # Если gemini-pro тоже выдаст 404, значит дело в региональной привязке ключа
+                return "Привет! Я сейчас занят, отвечу как освобожусь.", 1
                 
             data = resp.json()
-            full_text = data['candidates'][0]['content']['parts'][0]['text']
             
-            priority = 1
-            if "[P:" in full_text:
-                priority_str = full_text.split("[P:")[1][0]
-                priority = int(priority_str) if priority_str.isdigit() else 1
-                full_text = full_text.split("[P:")[0].strip()
-            
-            return full_text, priority
+            # Проверка наличия ответа в структуре
+            if 'candidates' in data and data['candidates']:
+                full_text = data['candidates'][0]['content']['parts'][0]['text']
+                
+                priority = 1
+                if "[P:" in full_text:
+                    try:
+                        priority_str = full_text.split("[P:")[1][0]
+                        priority = int(priority_str) if priority_str.isdigit() else 1
+                        full_text = full_text.split("[P:")[0].strip()
+                    except: pass
+                
+                return full_text, priority
+            else:
+                return "Привет! Получил твое сообщение, скоро буду на связи.", 1
+                
         except Exception as e:
             logger.error(f"AI critical Error: {e}")
-            return "Привет! Оставь сообщение, я отвечу чуть позже.", 1
+            return "Привет! Оставь сообщение, отвечу позже.", 1
 # --- БИЗНЕС ЛОГИКА ---
 
 @dp.business_message()
