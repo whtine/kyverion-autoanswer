@@ -11,7 +11,7 @@ from aiogram.types import Update, InlineKeyboardMarkup, InlineKeyboardButton, Bu
 from aiogram.filters import Command
 from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -26,133 +26,168 @@ app = FastAPI()
 class Form(StatesGroup):
     waiting_for_text = State()
 
-# --- БАЗА ДАННЫХ ---
+# --- СИСТЕМНЫЕ ФУНКЦИИ БД ---
+async def get_conn():
+    return await asyncpg.connect(DB_URL)
+
 async def get_user_data(user_id):
-    conn = await asyncpg.connect(DB_URL)
+    conn = await get_conn()
     row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
     await conn.close()
     return row
 
-async def toggle_user_status(user_id):
-    conn = await asyncpg.connect(DB_URL)
-    # Атомарный апдейт: если нет юзера - создаем со статусом True, если есть - инвертируем
-    await conn.execute('''
-        INSERT INTO users (user_id, is_active) VALUES ($1, TRUE)
-        ON CONFLICT (user_id) DO UPDATE SET is_active = NOT users.is_active
-    ''', user_id)
-    await conn.close()
+# --- МЕНЮ ---
+def get_main_kb(user_id, is_active):
+    status_emoji = "✅ ВКЛ" if is_active else "❌ ВЫКЛ"
+    buttons = [
+        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="edit")],
+        [InlineKeyboardButton(text=f"Статус: {status_emoji}", callback_data="switch")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="me")]
+    ]
+    if user_id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton(text="📁 База данных (ADM)", callback_data="admin_db")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def update_reply_text(user_id, text):
-    conn = await asyncpg.connect(DB_URL)
-    await conn.execute('''
-        INSERT INTO users (user_id, reply_text) VALUES ($1, $2)
-        ON CONFLICT (user_id) DO UPDATE SET reply_text = $2
-    ''', user_id, text)
-    await conn.close()
+# --- ОБРАБОТЧИКИ ---
 
-# --- АДМИНКА ---
-@dp.message(Command("db"), F.from_user.id == ADMIN_ID)
-async def export_db(message: types.Message):
-    conn = await asyncpg.connect(DB_URL)
-    rows = await conn.fetch("SELECT * FROM users")
-    await conn.close()
-    
-    report = "ID | Status | Text\n" + "-"*30 + "\n"
-    for r in rows:
-        report += f"{r['user_id']} | {r['is_active']} | {r['reply_text'][:20]}...\n"
-    
-    file = BufferedInputFile(report.encode(), filename="database.txt")
-    await message.answer_document(file, caption="Полная выгрузка базы данных.")
-
-# --- КОМАНДЫ ПОЛЬЗОВАТЕЛЯ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user = await get_user_data(message.from_user.id)
-    # Если юзера нет, создаем дефолт
     if not user:
-        await update_reply_text(message.from_user.id, "Я сейчас занят, отвечу позже.")
+        conn = await get_conn()
+        await conn.execute("INSERT INTO users (user_id, reply_text, is_active) VALUES ($1, $2, $3)", 
+                           message.from_user.id, "Я сейчас занят.", False)
+        await conn.close()
         user = await get_user_data(message.from_user.id)
 
-    status_emoji = "✅ ВКЛ" if user['is_active'] else "❌ ВЫКЛ"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="edit")],
-        [InlineKeyboardButton(text=f"Статус: {status_emoji}", callback_data="switch")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="me")]
-    ])
-    await message.answer(f"🤖 **Настройки автоответчика**\n\nСтатус: {status_emoji}\nТекст: {user['reply_text']}", 
-                         reply_markup=kb, parse_mode="Markdown")
+    await message.answer(
+        f"🤖 **Настройки автоответчика**\n\n"
+        f"Статус: {'✅ Работает' if user['is_active'] else '❌ Выключен'}\n"
+        f"Текст: `{user['reply_text']}`",
+        reply_markup=get_main_kb(message.from_user.id, user['is_active']),
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data == "switch")
 async def handle_switch(callback: types.CallbackQuery):
-    await toggle_user_status(callback.from_user.id)
     user = await get_user_data(callback.from_user.id)
-    await callback.answer(f"Теперь: {'ВКЛ' if user['is_active'] else 'ВЫКЛ'}")
+    new_status = not user['is_active']
+    conn = await get_conn()
+    await conn.execute("UPDATE users SET is_active = $1 WHERE user_id = $2", new_status, callback.from_user.id)
+    await conn.close()
     
-    # Обновляем сообщение (вместо удаления и пересылки, чтобы не мерцало)
-    status_emoji = "✅ ВКЛ" if user['is_active'] else "❌ ВЫКЛ"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Изменить текст", callback_data="edit")],
-        [InlineKeyboardButton(text=f"Статус: {status_emoji}", callback_data="switch")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="me")]
-    ])
-    await callback.message.edit_text(f"🤖 **Настройки автоответчика**\n\nСтатус: {status_emoji}\nТекст: {user['reply_text']}", 
-                                     reply_markup=kb, parse_mode="Markdown")
+    await callback.answer(f"Статус: {'ВКЛ' if new_status else 'ВЫКЛ'}")
+    # Обновляем это же сообщение
+    await callback.message.edit_text(
+        f"🤖 **Настройки автоответчика**\n\n"
+        f"Статус: {'✅ Работает' if new_status else '❌ Выключен'}\n"
+        f"Текст: `{user['reply_text']}`",
+        reply_markup=get_main_kb(callback.from_user.id, new_status),
+        parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data == "me")
 async def handle_profile(callback: types.CallbackQuery):
     user = await get_user_data(callback.from_user.id)
-    text = f"👤 **Ваш профиль**\n\nID: `{user['user_id']}`\nСтатус: {user['is_active']}\nТекст: {user['reply_text']}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]])
+    status_str = "Активен" if user['is_active'] else "Отключен"
+    text = (f"👤 **Профиль пользователя**\n\n"
+            f"🆔 ID: `{user['user_id']}`\n"
+            f"⚙️ Состояние: {status_str}\n"
+            f"💬 Текст: {user['reply_text']}")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_menu")]])
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "back")
-async def handle_back(callback: types.CallbackQuery):
-    await start_cmd(callback.message)
-    await callback.message.delete()
+@dp.callback_query(F.data == "back_to_menu")
+async def back_menu(callback: types.CallbackQuery):
+    user = await get_user_data(callback.from_user.id)
+    await callback.message.edit_text(
+        f"🤖 **Настройки автоответчика**\n\n"
+        f"Статус: {'✅ Работает' if user['is_active'] else '❌ Выключен'}\n"
+        f"Текст: `{user['reply_text']}`",
+        reply_markup=get_main_kb(callback.from_user.id, user['is_active']),
+        parse_mode="Markdown"
+    )
 
+# --- АДМИН КОМАНДЫ ---
+
+@dp.callback_query(F.data == "admin_db", F.from_user.id == ADMIN_ID)
+@dp.message(Command("db_view"), F.from_user.id == ADMIN_ID)
+async def db_view(event: types.Message | types.CallbackQuery):
+    conn = await get_conn()
+    rows = await conn.fetch("SELECT * FROM users")
+    await conn.close()
+    
+    res = "USER_ID | ACTIVE | TEXT\n" + "-"*40 + "\n"
+    for r in rows:
+        res += f"{r['user_id']} | {r['is_active']} | {r['reply_text'][:15]}...\n"
+    
+    file = BufferedInputFile(res.encode(), filename="users_db.txt")
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.message.answer_document(file, caption="📂 Текущая база пользователей")
+        await event.answer()
+    else:
+        await event.answer_document(file)
+
+@dp.message(Command("db_clear"), F.from_user.id == ADMIN_ID)
+async def db_clear(message: types.Message):
+    conn = await get_conn()
+    await conn.execute("DELETE FROM users WHERE user_id != $1", ADMIN_ID)
+    await conn.close()
+    await message.answer("⚠ База данных очищена (кроме вашего аккаунта).")
+
+# --- ИЗМЕНЕНИЕ ТЕКСТА ---
 @dp.callback_query(F.data == "edit")
-async def handle_edit(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Пришли новый текст:")
+async def edit_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("⌨ Введите новый текст ответа:")
     await state.set_state(Form.waiting_for_text)
+    await callback.answer()
 
 @dp.message(Form.waiting_for_text)
-async def save_text(message: types.Message, state: FSMContext):
-    await update_reply_text(message.from_user.id, message.text)
+async def edit_finish(message: types.Message, state: FSMContext):
+    conn = await get_conn()
+    await conn.execute("UPDATE users SET reply_text = $1 WHERE user_id = $2", message.text, message.from_user.id)
+    await conn.close()
     await state.clear()
-    await message.answer("✅ Текст обновлен!")
+    await message.answer("✅ Текст обновлен успешно!")
     await start_cmd(message)
 
-# --- АВТООТВЕТ ---
+# --- ЛОГИКА БИЗНЕСА (ФИКС) ---
 @dp.business_message()
 async def business_handler(message: types.Message):
-    # Твой лог показал, что настройки ищутся по chat.id (это владелец)
+    # ВАЖНО: В бизнес-сообщении chat.id — это ВСЕГДА владелец аккаунта
     owner_id = message.chat.id
     user_config = await get_user_data(owner_id)
     
     if user_config and user_config['is_active']:
-        # Если пишет НЕ владелец аккаунта
+        # Отвечаем, только если пишет НЕ владелец
         if message.from_user.id != owner_id:
-            logger.info(f"Auto-reply sent for owner {owner_id}")
-            await message.answer(user_config['reply_text'])
+            try:
+                await message.answer(user_config['reply_text'])
+                logger.info(f"Sent reply for {owner_id} to {message.from_user.id}")
+            except Exception as e:
+                logger.error(f"Error sending business reply: {e}")
 
-# --- СЕРВЕР ---
+# --- ИНИЦИАЛИЗАЦИЯ И ВЕБХУК ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    conn = await get_conn()
+    await conn.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY, 
+        reply_text TEXT, 
+        is_active BOOLEAN DEFAULT FALSE)''')
+    await conn.close()
+    await bot.set_webhook(url=f"{APP_URL}/webhook", allowed_updates=["business_message", "message", "callback_query"])
+    asyncio.create_task(ping_self())
+    yield
+
 async def ping_self():
     async with httpx.AsyncClient() as client:
         while True:
             await asyncio.sleep(600)
             try: await client.get(APP_URL)
             except: pass
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Создаем таблицу при старте, если вдруг она пропала
-    conn = await asyncpg.connect(DB_URL)
-    await conn.execute('CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, reply_text TEXT, is_active BOOLEAN DEFAULT FALSE)')
-    await conn.close()
-    
-    await bot.set_webhook(url=f"{APP_URL}/webhook", allowed_updates=["business_message", "message", "callback_query"])
-    asyncio.create_task(ping_self())
-    yield
 
 app.router.lifespan_context = lifespan
 
@@ -163,4 +198,4 @@ async def webhook(request: Request):
     return {"ok": True}
 
 @app.get("/")
-async def root(): return {"status": "online"}
+async def root(): return {"status": "ok"}
