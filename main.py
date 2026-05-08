@@ -234,3 +234,7 @@ async def webhook(request: Request):
     update = Update.model_validate(await request.json(), context={"bot": bot})
     await dp.feed_update(bot, update)
     return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"status": "working", "ai_mode": "gemini-pro"}
