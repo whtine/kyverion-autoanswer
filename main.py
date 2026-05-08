@@ -37,45 +37,48 @@ async def ask_gemini(user_text, zone_context, remaining_msgs):
     if not GEMINI_KEY:
         return "Извини, мой ИИ-модуль не настроен.", 1
         
-    # Исправленный URL (добавлен v1 вместо v1beta или наоборот, пробуем v1)
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    # Путь через v1beta (самый рабочий для Flash сейчас)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     
     headers = {'Content-Type': 'application/json'}
     
-    prompt = f"""
-    Ты — ИИ-ассистент владельца аккаунта. Владелец сейчас: {zone_context}.
-    1. Ответь вежливо на языке пользователя.
-    2. Добавь: "(ИИ-ассистент. Осталось: {remaining_msgs} зап.)".
-    3. Оцени важность от 1 до 3.
-    4. В конце добавь [P:X], где X - приоритет.
-    
-    Текст пользователя: {user_text}
-    """
-    
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    # Мы упаковываем промпт так, как этого требует структура Google API
+    payload = {
+        "contents": [
+            {
+                "parts": [{
+                    "text": f"Ты — ИИ-ассистент владельца. Он сейчас: {zone_context}. "
+                            f"Ответь вежливо на языке пользователя. "
+                            f"Добавь: (ИИ-ассистент. Осталось: {remaining_msgs} зап.). "
+                            f"Оцени важность от 1 до 3 и добавь в конце [P:X]. "
+                            f"Текст пользователя: {user_text}"
+                }]
+            }
+        ]
+    }
     
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=15.0)
             
-            # Если получили ошибку (404, 400 и т.д.)
             if resp.status_code != 200:
+                # Если 404 не уйдет, попробуй в URL выше заменить gemini-1.5-flash на gemini-pro
                 logger.error(f"Google API Error: {resp.status_code} - {resp.text}")
-                return "Привет! Я сейчас занят, отвечу позже.", 1
+                return "Привет! Сейчас я занят, отвечу позже как освобожусь.", 1
                 
             data = resp.json()
             full_text = data['candidates'][0]['content']['parts'][0]['text']
             
             priority = 1
             if "[P:" in full_text:
-                priority = int(full_text.split("[P:")[1][0])
+                priority_str = full_text.split("[P:")[1][0]
+                priority = int(priority_str) if priority_str.isdigit() else 1
                 full_text = full_text.split("[P:")[0].strip()
             
             return full_text, priority
         except Exception as e:
             logger.error(f"AI critical Error: {e}")
-            return "Привет! Сейчас не могу говорить, буду позже.", 1
-
+            return "Привет! Оставь сообщение, я отвечу чуть позже.", 1
 # --- БИЗНЕС ЛОГИКА ---
 
 @dp.business_message()
