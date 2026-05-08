@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("AUTO_BOT")
+logger = logging.getLogger("PRO_AUTO_BOT")
 
 TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
@@ -25,203 +25,205 @@ active_waits = {}
 class Form(StatesGroup):
     waiting_for_text = State()
     waiting_for_hours = State()
+    waiting_for_delay = State()
 
 async def get_conn():
     return await asyncpg.connect(DB_URL)
 
 async def add_log(event_type, details):
-    """Записывает событие в таблицу логов в БД"""
     try:
         conn = await get_conn()
         await conn.execute("INSERT INTO logs (event_time, event_type, details) VALUES ($1, $2, $3)", 
                            datetime.now(), event_type, str(details))
         await conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка записи лога: {e}")
+    except: pass
+
+# --- ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ---
+
+def is_hour_in_range(range_str, h):
+    try:
+        start, end = map(int, range_str.split("-"))
+        if start == 0 and end == 0: return False
+        if start < end: return start <= h < end
+        return h >= start or h < end # Переход через полночь (например, 22-7)
+    except: return False
 
 # --- БИЗНЕС ЛОГИКА ---
 
 @dp.business_message()
 async def business_handler(message: types.Message):
     chat_id = message.chat.id
-    sender_id = message.from_user.id
-
-    # Если отвечаешь ТЫ - отменяем таймер бота
-    if sender_id == MY_ID:
+    if message.from_user.id == MY_ID:
         if chat_id in active_waits:
             active_waits[chat_id].cancel()
-            del active_waits[chat_id]
-            await add_log("CANCEL", f"Владелец ответил сам в чат {chat_id}")
+            active_waits.pop(chat_id, None)
+            await add_log("CANCEL", f"Ты ответил сам в чат {chat_id}")
         return
 
-    # Если пишет КЛИЕНТ
     conn = await get_conn()
-    config = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
+    u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
     await conn.close()
 
-    if config and config['is_active']:
-        # Проверка времени
-        current_hour = datetime.now().hour
-        start_h = config.get('work_start', 0)
-        end_h = config.get('work_end', 24)
+    if u and u['is_active']:
+        if chat_id in active_waits: return
+        
+        h = datetime.now().hour
+        # Проверяем зоны по приоритету: Ночь -> Утро -> День
+        if is_hour_in_range(u.get('range_night', '0-0'), h):
+            reply_text, zone = u.get('text_night'), "НОЧЬ"
+        elif is_hour_in_range(u.get('range_morning', '0-0'), h):
+            reply_text, zone = u.get('text_morning'), "УТРО"
+        else:
+            reply_text, zone = u.get('reply_text'), "ДЕНЬ"
 
-        if not (start_h <= current_hour < end_h):
-            # Вне рабочего времени - не отвечаем
-            return
+        if not reply_text: reply_text = u['reply_text'] # Фолбэк на основной
 
-        # Если уже ждем ответа в этом чате - не плодим задачи
-        if chat_id in active_waits:
-            return
-
-        await add_log("RECEIVE", f"Новое от {sender_id}. Ждем 30с.")
-        task = asyncio.create_task(delayed_reply(message, config))
+        delay = u.get('delay_sec', 30)
+        await add_log("RECEIVE", f"Входное ({zone}). Ждем {delay}с.")
+        task = asyncio.create_task(delayed_reply(message, reply_text, delay))
         active_waits[chat_id] = task
 
-async def delayed_reply(message, config):
-    chat_id = message.chat.id
+async def delayed_reply(message, text, delay):
     try:
-        await asyncio.sleep(30) # Задержка перед автоответом
-        reply_text = config['reply_text']
-        await message.answer(reply_text)
-        await add_log("SENT", f"Бот ответил пользователю {message.from_user.id}")
-    except asyncio.CancelledError:
-        # Сюда попадем, если ты ответил сам в течение 30 секунд
-        pass
-    finally:
-        if chat_id in active_waits:
-            del active_waits[chat_id]
+        await asyncio.sleep(delay)
+        await message.answer(text)
+        await add_log("SENT", f"Ответил: {text[:20]}...")
+    except asyncio.CancelledError: pass
+    finally: active_waits.pop(message.chat.id, None)
 
-# --- КОМАНДЫ И УПРАВЛЕНИЕ ---
+# --- МЕНЮ ---
 
 @dp.message(Command("start"), F.from_user.id == MY_ID)
 async def start_cmd(message: types.Message):
     conn = await get_conn()
-    user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
-    
-    if not user:
-        await conn.execute("INSERT INTO users (user_id, reply_text, is_active) VALUES ($1, $2, $3)", 
-                           MY_ID, "Привет! Я сейчас занят.", False)
-        user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
+    u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
+    if not u:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1)", MY_ID)
+        u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
     await conn.close()
-
-    # Защита от KeyError: берем данные безопасно
-    is_active = user.get('is_active', False)
-    w_start = user.get('work_start', 0)
-    w_end = user.get('work_end', 24)
-    txt = user.get('reply_text', "Текст не установлен")
-
-    status_emoji = "✅ ВКЛ" if is_active else "❌ ВЫКЛ"
+    
+    status = "✅ ВКЛ" if u['is_active'] else "❌ ВЫКЛ"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Текст ответа", callback_data="edit_text")],
-        [InlineKeyboardButton(text="⏰ Часы работы", callback_data="edit_hours")],
-        [InlineKeyboardButton(text=f"Статус: {status_emoji}", callback_data="switch")],
-        [InlineKeyboardButton(text="📊 Логи БД", callback_data="get_logs")]
+        [InlineKeyboardButton(text="🌅 Утро", callback_data="menu_morning"),
+         InlineKeyboardButton(text="☀️ День", callback_data="menu_day"),
+         InlineKeyboardButton(text="🌃 Ночь", callback_data="menu_night")],
+        [InlineKeyboardButton(text=f"⏱ КД: {u['delay_sec']}с", callback_data="set_delay")],
+        [InlineKeyboardButton(text=f"Статус: {status}", callback_data="switch")],
+        [InlineKeyboardButton(text="📊 Логи", callback_data="get_logs")]
     ])
     
-    await message.answer(
-        f"🛠 **Настройки автоответчика**\n\n"
-        f"Статус: {status_emoji}\n"
-        f"Текст: `{txt}`\n"
-        f"Часы: `{w_start}:00 - {w_end}:00` (UTC)\n\n"
-        f"Задержка: 30 секунд.",
-        reply_markup=kb, parse_mode="Markdown"
-    )
+    text = (f"⚙️ **Настройки бота (UTC)**\n\n"
+            f"🌅 **Утро ({u['range_morning']}):** `{u['text_morning']}`\n"
+            f"☀️ **День (Остальное):** `{u['reply_text']}`\n"
+            f"🌃 **Ночь ({u['range_night']}):** `{u['text_night']}`\n\n"
+            f"КД: {u['delay_sec']} секунд")
+    
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "switch", F.from_user.id == MY_ID)
-async def handle_switch(callback: types.CallbackQuery):
-    conn = await get_conn()
-    await conn.execute("UPDATE users SET is_active = NOT is_active WHERE user_id = $1", MY_ID)
-    await conn.close()
-    await callback.answer("Статус изменен")
+@dp.callback_query(F.data.startswith("menu_"))
+async def zone_menu(callback: types.CallbackQuery):
+    zone = callback.data.split("_")[1]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Изменить текст", callback_data=f"edit_text_{zone}")],
+        [InlineKeyboardButton(text="⏰ Изменить часы", callback_data=f"edit_hours_{zone}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
+    ])
+    await callback.message.edit_text(f"Настройка зоны: **{zone.upper()}**", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "back")
+async def back_to_start(callback: types.CallbackQuery):
     await start_cmd(callback.message)
     await callback.message.delete()
 
-@dp.callback_query(F.data == "edit_hours", F.from_user.id == MY_ID)
-async def edit_hours_req(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите диапазон часов, когда бот должен работать (например `9-21`):")
-    await state.set_state(Form.waiting_for_hours)
+# --- ФУНКЦИИ РЕДАКТИРОВАНИЯ ---
 
-@dp.message(Form.waiting_for_hours, F.from_user.id == MY_ID)
-async def save_hours(message: types.Message, state: FSMContext):
-    try:
-        h_range = message.text.replace(" ", "").split("-")
-        start_h, end_h = int(h_range[0]), int(h_range[1])
-        conn = await get_conn()
-        await conn.execute("UPDATE users SET work_start=$1, work_end=$2 WHERE user_id=$3", start_h, end_h, MY_ID)
-        await conn.close()
-        await message.answer(f"✅ Время работы: {start_h}:00 - {end_h}:00")
-        await state.clear()
-        await start_cmd(message)
-    except Exception:
-        await message.answer("❌ Ошибка! Введите формат `начало-конец`, например `10-20`")
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit_router(callback: types.CallbackQuery, state: FSMContext):
+    _, target, zone = callback.data.split("_")
+    await state.update_data(target=target, zone=zone)
+    if target == "text":
+        await callback.message.answer(f"Введите текст для {zone.upper()}:")
+        await state.set_state(Form.waiting_for_text)
+    else:
+        await callback.message.answer(f"Введите часы (напр. `23-7`):")
+        await state.set_state(Form.waiting_for_hours)
 
-@dp.callback_query(F.data == "edit_text", F.from_user.id == MY_ID)
-async def edit_text_req(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Пришли новый текст для автоответа:")
-    await state.set_state(Form.waiting_for_text)
-
-@dp.message(Form.waiting_for_text, F.from_user.id == MY_ID)
+@dp.message(Form.waiting_for_text)
 async def save_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    zone, col = data['zone'], "reply_text" if data['zone'] == "day" else f"text_{data['zone']}"
     conn = await get_conn()
-    await conn.execute("UPDATE users SET reply_text=$1 WHERE user_id=$2", message.text, MY_ID)
+    await conn.execute(f"UPDATE users SET {col} = $1 WHERE user_id = $2", message.text, MY_ID)
     await conn.close()
     await state.clear()
-    await message.answer("✅ Текст обновлен")
     await start_cmd(message)
 
-@dp.callback_query(F.data == "get_logs", F.from_user.id == MY_ID)
+@dp.message(Form.waiting_for_hours)
+async def save_hours(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if data['zone'] == "day": return
+    conn = await get_conn()
+    await conn.execute(f"UPDATE users SET range_{data['zone']} = $1 WHERE user_id = $2", message.text.replace(" ",""), MY_ID)
+    await conn.close()
+    await state.clear()
+    await start_cmd(message)
+
+@dp.callback_query(F.data == "set_delay")
+async def delay_req(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите задержку (сек):")
+    await state.set_state(Form.waiting_for_delay)
+
+@dp.message(Form.waiting_for_delay)
+async def delay_save(message: types.Message, state: FSMContext):
+    if message.text.isdigit():
+        conn = await get_conn()
+        await conn.execute("UPDATE users SET delay_sec = $1 WHERE user_id = $2", int(message.text), MY_ID)
+        await conn.close()
+        await state.clear()
+        await start_cmd(message)
+
+@dp.callback_query(F.data == "switch")
+async def toggle(callback: types.CallbackQuery):
+    conn = await get_conn()
+    await conn.execute("UPDATE users SET is_active = NOT is_active WHERE user_id = $1", MY_ID)
+    await conn.close()
+    await start_cmd(callback.message)
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "get_logs")
 async def get_logs_btn(callback: types.CallbackQuery):
     conn = await get_conn()
-    rows = await conn.fetch("SELECT * FROM logs ORDER BY event_time DESC LIMIT 50")
+    rows = await conn.fetch("SELECT * FROM logs ORDER BY event_time DESC LIMIT 40")
     await conn.close()
-    
-    if not rows:
-        await callback.answer("Логов пока нет")
-        return
+    res = "LOGS:\n" + "\n".join([f"[{r['event_time'].strftime('%H:%M')}] {r['event_type']}: {r['details']}" for r in rows])
+    await callback.message.answer_document(BufferedInputFile(res.encode(), filename="logs.txt"))
 
-    output = "ПОСЛЕДНИЕ СОБЫТИЯ:\n" + "="*20 + "\n"
-    for r in rows:
-        output += f"[{r['event_time'].strftime('%H:%M:%S')}] {r['event_type']}: {r['details']}\n"
-    
-    file = BufferedInputFile(output.encode(), filename="logs.txt")
-    await callback.message.answer_document(file, caption="История действий бота")
-    await callback.answer()
-
-# --- СЛУЖЕБНОЕ: ПИНГЕР И БД ---
-
-async def pinger():
-    """Не дает Render усыпить бота"""
-    async with httpx.AsyncClient() as client:
-        while True:
-            await asyncio.sleep(300) # 5 минут
-            try:
-                r = await client.get(APP_URL)
-                logger.info(f"Ping: {r.status_code}")
-            except: pass
+# --- ИНИЦИАЛИЗАЦИЯ И ЗАПУСК ---
 
 async def init_db():
     conn = await get_conn()
-    # Создаем таблицы
     await conn.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY, 
-        reply_text TEXT DEFAULT 'Я занят', 
+        reply_text TEXT DEFAULT 'Занят', 
         is_active BOOLEAN DEFAULT FALSE,
-        work_start INTEGER DEFAULT 0,
-        work_end INTEGER DEFAULT 24
+        delay_sec INTEGER DEFAULT 30,
+        text_morning TEXT DEFAULT 'Доброе утро',
+        range_morning TEXT DEFAULT '0-0',
+        text_night TEXT DEFAULT 'Сплю',
+        range_night TEXT DEFAULT '0-0'
     )''')
-    await conn.execute('''CREATE TABLE IF NOT EXISTS logs (
-        id SERIAL PRIMARY KEY,
-        event_time TIMESTAMP,
-        event_type TEXT,
-        details TEXT
-    )''')
-    # ПРИНУДИТЕЛЬНОЕ добавление колонок, если таблица была создана ранее без них
-    try:
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_start INTEGER DEFAULT 0")
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_end INTEGER DEFAULT 24")
-    except: pass
+    for c, t in [("delay_sec","INT DEFAULT 30"), ("text_morning","TEXT"), ("range_morning","TEXT DEFAULT '0-0'"), ("text_night","TEXT"), ("range_night","TEXT DEFAULT '0-0'")]:
+        try: await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {c} {t}")
+        except: pass
+    await conn.execute('CREATE TABLE IF NOT EXISTS logs (id SERIAL PRIMARY KEY, event_time TIMESTAMP, event_type TEXT, details TEXT)')
     await conn.close()
-    logger.info("БД готова.")
+
+async def pinger():
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(300)
+            try: await client.get(APP_URL)
+            except: pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -234,13 +236,9 @@ app.router.lifespan_context = lifespan
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        body = await request.json()
-        update = Update.model_validate(body, context={"bot": bot})
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
     return {"ok": True}
 
 @app.get("/")
-async def root(): return {"status": "alive"}
+async def root(): return {"status": "ok"}
