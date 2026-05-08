@@ -37,30 +37,35 @@ async def ask_gemini(user_text, zone_context, remaining_msgs):
     if not GEMINI_KEY:
         return "Извини, мой ИИ-модуль не настроен.", 1
         
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    # Исправленный URL (добавлен v1 вместо v1beta или наоборот, пробуем v1)
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    
+    headers = {'Content-Type': 'application/json'}
     
     prompt = f"""
-    Ты — ИИ-ассистент владельца этого аккаунта. Владелец сейчас занят: {zone_context}.
-    ТВОИ ЗАДАЧИ:
+    Ты — ИИ-ассистент владельца аккаунта. Владелец сейчас: {zone_context}.
     1. Ответь вежливо на языке пользователя.
-    2. В конце ответа ОБЯЗАТЕЛЬНО добавь фразу: "(Я — ИИ-ассистент. Лимит: {remaining_msgs} запросов)".
-    3. Оцени важность сообщения от 1 до 3:
-       1 - Просто приветствие или неважное.
-       2 - Вопрос по делу.
-       3 - Срочно/Бизнес/Важно.
-    4. В самом конце сообщения добавь скрытый тег [P:X], где X - это цифра приоритета.
+    2. Добавь: "(ИИ-ассистент. Осталось: {remaining_msgs} зап.)".
+    3. Оцени важность от 1 до 3.
+    4. В конце добавь [P:X], где X - приоритет.
     
-    Сообщение пользователя: {user_text}
+    Текст пользователя: {user_text}
     """
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(url, json=payload, timeout=15.0)
+            resp = await client.post(url, json=payload, headers=headers, timeout=15.0)
+            
+            # Если получили ошибку (404, 400 и т.д.)
+            if resp.status_code != 200:
+                logger.error(f"Google API Error: {resp.status_code} - {resp.text}")
+                return "Привет! Я сейчас занят, отвечу позже.", 1
+                
             data = resp.json()
             full_text = data['candidates'][0]['content']['parts'][0]['text']
             
-            # Вытаскиваем приоритет
             priority = 1
             if "[P:" in full_text:
                 priority = int(full_text.split("[P:")[1][0])
@@ -68,8 +73,8 @@ async def ask_gemini(user_text, zone_context, remaining_msgs):
             
             return full_text, priority
         except Exception as e:
-            logger.error(f"AI Error: {e}")
-            return "Привет! Я сейчас занят, отвечу позже.", 1
+            logger.error(f"AI critical Error: {e}")
+            return "Привет! Сейчас не могу говорить, буду позже.", 1
 
 # --- БИЗНЕС ЛОГИКА ---
 
