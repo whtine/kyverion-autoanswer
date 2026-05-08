@@ -118,19 +118,42 @@ async def business_handler(message: types.Message):
 @dp.message(Command("start"), F.from_user.id == MY_ID)
 async def start_cmd(message: types.Message):
     conn = await get_conn()
+    
+    # 1. Пытаемся получить данные
     u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
+    
+    # 2. Если данных нет (u is None), создаем пустую запись для тебя
+    if not u:
+        await conn.execute("""
+            INSERT INTO users (user_id, is_active, delay_sec, max_limit, notes, signals) 
+            VALUES ($1, TRUE, 30, 10, 'Я владелец аккаунта.', 'Отвечай дружелюбно.')
+        """, MY_ID)
+        # Перезапрашиваем данные, чтобы переменная u перестала быть None
+        u = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", MY_ID)
+    
     await conn.close()
     
+    # 3. Теперь u точно не None, и код не упадет
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Заметки (О тебе)", callback_data="set_notes")],
         [InlineKeyboardButton(text="🚨 Сигналы (Сценарии)", callback_data="set_signals")],
         [InlineKeyboardButton(text=f"📊 Лимит: {u['max_limit']}", callback_data="set_limit")],
         [InlineKeyboardButton(text=f"⏱ КД: {u['delay_sec']}с", callback_data="set_delay")],
-        [InlineKeyboardButton(text="♻️ Сброс", callback_data="clear"), InlineKeyboardButton(text=("✅" if u['is_active'] else "❌"), callback_data="switch")]
+        [InlineKeyboardButton(text="♻️ Сброс", callback_data="clear"), 
+         InlineKeyboardButton(text=("✅" if u['is_active'] else "❌"), callback_data="switch")]
     ])
     
-    await message.answer(f"⚙️ **Панель управления ИИ**\n\n**Заметки:** {u['notes'][:100]}...\n\n**Сигналы:** {u['signals'][:100]}...", reply_markup=kb)
-
+    # Берем первые 100 символов, если они есть
+    notes_preview = (u['notes'][:100] + "...") if u['notes'] else "Пусто"
+    signals_preview = (u['signals'][:100] + "...") if u['signals'] else "Пусто"
+    
+    await message.answer(
+        f"⚙️ **Панель управления ИИ**\n\n"
+        f"**Заметки:** {notes_preview}\n\n"
+        f"**Сигналы:** {signals_preview}", 
+        reply_markup=kb
+    )
+    
 @dp.callback_query(F.data.startswith("set_"))
 async def handle_settings(cb: types.CallbackQuery, state: FSMContext):
     action = cb.data.split("_")[1]
