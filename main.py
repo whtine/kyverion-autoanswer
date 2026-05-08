@@ -67,7 +67,7 @@ async def business_handler(message: types.Message):
     if u and u['is_active']:
         if chat_id in active_waits: return
         
-        h = datetime.now().hour
+        h = (datetime.utcnow().hour + 2) % 24
         # Проверяем зоны по приоритету: Ночь -> Утро -> День
         if is_hour_in_range(u.get('range_night', '0-0'), h):
             reply_text, zone = u.get('text_night'), "НОЧЬ"
