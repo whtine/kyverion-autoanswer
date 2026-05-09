@@ -66,7 +66,7 @@ async def ask_gemini(user_text, zone_context, remaining_msgs, notes, signals, mo
             resp = await client.post(url, json=payload, timeout=25.0)
             
             if resp.status_code == 429:
-                return "⚠️ Лимит. Подождите минуту.", 1
+                return "⚠️ Limit", 1
             
             if resp.status_code != 200:
                 logger.error(f"API Error: {resp.text}")
